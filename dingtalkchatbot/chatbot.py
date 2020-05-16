@@ -3,10 +3,26 @@
 # create time: 07/01/2018 11:35
 __author__ = 'Devin -- http://zhangchuzhao.site'
 
+import re
+import sys
 import json
 import time
 import logging
 import requests
+import urllib
+import hmac
+import base64
+import hashlib
+import queue
+
+_ver = sys.version_info
+is_py3 = (_ver[0] == 3)
+
+try:
+    quote_plus = urllib.parse.quote_plus
+except AttributeError:
+    quote_plus = urllib.quote_plus
+
 try:
     JSONDecodeError = json.decoder.JSONDecodeError
 except AttributeError:
@@ -38,24 +54,64 @@ class DingtalkChatbot(object):
     """
     钉钉群自定义机器人（每个机器人每分钟最多发送20条），支持文本（text）、连接（link）、markdown三种消息类型！
     """
-    def __init__(self, webhook):
+    def __init__(self, webhook, secret=None, pc_slide=False):
         """
         机器人初始化
         :param webhook: 钉钉群自定义机器人webhook地址
+        :param secret: 机器人安全设置页面勾选“加签”时需要传入的密钥
+        :param pc_slide: 消息链接打开方式，默认False为浏览器打开，设置为True时为PC端侧边栏打开
         """
         super(DingtalkChatbot, self).__init__()
         self.headers = {'Content-Type': 'application/json; charset=utf-8'}
+        self.queue = queue.Queue(20)  # 钉钉官方限流每分钟发送20条信息
         self.webhook = webhook
-        self.times = 0
-        self.start_time = time.time()
+        self.secret = secret
+        self.pc_slide = pc_slide
+        self.start_time = time.time()  # 加签时，请求时间戳与请求时间不能超过1小时，用于定时更新签名
+        if self.secret is not None and self.secret.startswith('SEC'):
+            self.update_webhook()
+            
+    def update_webhook(self):
+        """
+        钉钉群自定义机器人安全设置加签时，签名中的时间戳与请求时不能超过一个小时，所以每个1小时需要更新签名
+        """
+        if is_py3:
+            timestamp = round(self.start_time * 1000)
+            string_to_sign = '{}\n{}'.format(timestamp, self.secret)
+            hmac_code = hmac.new(self.secret.encode(), string_to_sign.encode(), digestmod=hashlib.sha256).digest()            
+        else:
+            timestamp = long(round(self.start_time * 1000))
+            secret_enc = bytes(self.secret).encode('utf-8')
+            string_to_sign = '{}\n{}'.format(timestamp, self.secret)
+            string_to_sign_enc = bytes(string_to_sign).encode('utf-8')
+            hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
+        
+        sign = quote_plus(base64.b64encode(hmac_code))
+        self.webhook = '{}&timestamp={}&sign={}'.format(self.webhook, str(timestamp), sign)
+                
 
-    def send_text(self, msg, is_at_all=False, at_mobiles=[], at_dingtalk_ids=[]):
+
+    def msg_open_type(self, url):
+        """
+        消息链接的打开方式
+        1、默认或不设置时，为浏览器打开：pc_slide=False
+        2、在PC端侧边栏打开：pc_slide=True
+        """
+        encode_url = quote_plus(url)
+        if self.pc_slide:
+            final_link = 'dingtalk://dingtalkclient/page/link?url={}&pc_slide=true'.format(encode_url)
+        else:
+            final_link = 'dingtalk://dingtalkclient/page/link?url={}&pc_slide=false'.format(encode_url)
+        return final_link        
+
+    def send_text(self, msg, is_at_all=False, at_mobiles=[], at_dingtalk_ids=[], is_auto_at=True):
         """
         text类型
         :param msg: 消息内容
         :param is_at_all: @所有人时：true，否则为false（可选）
-        :param at_mobiles: 被@人的手机号（可选）
+        :param at_mobiles: 被@人的手机号（注意：可以在msg内容里自定义@手机号的位置，也支持同时@多个手机号，可选）
         :param at_dingtalk_ids: 被@人的dingtalkId（可选）
+        :param is_auto_at: 是否自动在msg内容末尾添加@手机号，默认自动添加，可设置为False取消（可选）
         :return: 返回消息发送结果
         """
         data = {"msgtype": "text", "at": {}}
@@ -71,6 +127,9 @@ class DingtalkChatbot(object):
         if at_mobiles:
             at_mobiles = list(map(str, at_mobiles))
             data["at"]["atMobiles"] = at_mobiles
+            if is_auto_at:
+                mobiles_text = '\n@' + '@'.join(at_mobiles)
+                data["text"]["content"] = msg + mobiles_text
 
         if at_dingtalk_ids:
             at_dingtalk_ids = list(map(str, at_dingtalk_ids))
@@ -82,7 +141,7 @@ class DingtalkChatbot(object):
     def send_image(self, pic_url):
         """
         image类型（表情）
-        :param pic_url: 图片表情链接
+        :param pic_url: 图片链接
         :return: 返回消息发送结果
         """
         if is_not_null_and_blank_str(pic_url):
@@ -108,14 +167,14 @@ class DingtalkChatbot(object):
         :return: 返回消息发送结果
 
         """
-        if is_not_null_and_blank_str(title) and is_not_null_and_blank_str(text) and is_not_null_and_blank_str(message_url):
+        if all(map(is_not_null_and_blank_str, [title, text, message_url])):
             data = {
                     "msgtype": "link",
                     "link": {
                         "text": text,
                         "title": title,
                         "picUrl": pic_url,
-                        "messageUrl": message_url
+                        "messageUrl": self.msg_open_type(message_url)
                     }
             }
             logging.debug('link类型：%s' % data)
@@ -124,17 +183,20 @@ class DingtalkChatbot(object):
             logging.error("link类型中消息标题或内容或链接不能为空！")
             raise ValueError("link类型中消息标题或内容或链接不能为空！")
 
-    def send_markdown(self, title, text, is_at_all=False, at_mobiles=[], at_dingtalk_ids=[]):
+    def send_markdown(self, title, text, is_at_all=False, at_mobiles=[], at_dingtalk_ids=[], is_auto_at=True):
         """
         markdown类型
         :param title: 首屏会话透出的展示内容
         :param text: markdown格式的消息内容
-        :param is_at_all: 被@人的手机号（在text内容里要有@手机号，可选）
-        :param at_mobiles: @所有人时：true，否则为：false（可选）
+        :param is_at_all: @所有人时：true，否则为：false（可选）
+        :param at_mobiles: 被@人的手机号（默认自动添加在text内容末尾，可取消自动化添加改为自定义设置，可选）
         :param at_dingtalk_ids: 被@人的dingtalkId（可选）
+        :param is_auto_at: 是否自动在text内容末尾添加@手机号，默认自动添加，可设置为False取消（可选）        
         :return: 返回消息发送结果
         """
-        if is_not_null_and_blank_str(title) and is_not_null_and_blank_str(text):
+        if all(map(is_not_null_and_blank_str, [title, text])):
+            # 给Mardown文本消息中的跳转链接添加上跳转方式
+            text = re.sub(r'(?<!!)\[.*?\]\((.*?)\)', lambda m: m.group(0).replace(m.group(1), self.msg_open_type(m.group(1))), text)
             data = {
                 "msgtype": "markdown",
                 "markdown": {
@@ -149,6 +211,9 @@ class DingtalkChatbot(object):
             if at_mobiles:
                 at_mobiles = list(map(str, at_mobiles))
                 data["at"]["atMobiles"] = at_mobiles
+                if is_auto_at:
+                    mobiles_text = '\n@' + '@'.join(at_mobiles)
+                    data["markdown"]["text"] = text + mobiles_text
 
             if at_dingtalk_ids:
                 at_dingtalk_ids = list(map(str, at_dingtalk_ids))
@@ -168,26 +233,42 @@ class DingtalkChatbot(object):
         """
         if isinstance(action_card, ActionCard):
             data = action_card.get_data()
+            
+            if "singleURL" in data["actionCard"]:
+                data["actionCard"]["singleURL"] = self.msg_open_type(data["actionCard"]["singleURL"])
+            elif "btns" in data["actionCard"]:
+                for btn in data["actionCard"]["btns"]:
+                    btn["actionURL"] = self.msg_open_type(btn["actionURL"])
+            
             logging.debug("ActionCard类型：%s" % data)
             return self.post(data)
         else:
-            logging.error("ActionCard类型：传入的实例类型不正确！")
-            raise TypeError("ActionCard类型：传入的实例类型不正确！")
+            logging.error("ActionCard类型：传入的实例类型不正确，内容为：{}".format(str(action_card)))
+            raise TypeError("ActionCard类型：传入的实例类型不正确，内容为：{}".format(str(action_card)))
 
     def send_feed_card(self, links):
         """
         FeedCard类型
-        :param links: 信息集（FeedLink数组）
+        :param links: FeedLink实例列表 or CardItem实例列表
         :return: 返回消息发送结果
         """
-        link_data_list = []
+        if not isinstance(links, list):
+            logging.error("FeedLink类型：传入的数据格式不正确，内容为：{}".format(str(links)))
+            raise ValueError("FeedLink类型：传入的数据格式不正确，内容为：{}".format(str(links)))
+        
+        link_list = []
         for link in links:
+            # 兼容：1、传入FeedLink实例列表；2、CardItem实例列表；
             if isinstance(link, FeedLink) or isinstance(link, CardItem):
-                link_data_list.append(link.get_data())
-        if link_data_list:
-            # 兼容：1、传入FeedLink或CardItem实例列表；2、传入数据字典列表；
-            links = link_data_list
-        data = {"msgtype": "feedCard", "feedCard": {"links": links}}
+                link = link.get_data()
+                link['messageURL'] = self.msg_open_type(link['messageURL'])
+                link_list.append(link)
+            else:
+                logging.error("FeedLink类型，传入的数据格式不正确，内容为：{}".format(str(link)))
+                raise ValueError("FeedLink类型，传入的数据格式不正确，内容为：{}".format(str(link)))
+
+        
+        data = {"msgtype": "feedCard", "feedCard": {"links": link_list}}
         logging.debug("FeedCard类型：%s" % data)
         return self.post(data)
 
@@ -197,15 +278,24 @@ class DingtalkChatbot(object):
         :param data: 消息数据（字典）
         :return: 返回发送结果
         """
-        self.times += 1
-        if self.times % 20 == 0:
-            if time.time() - self.start_time < 60:
-                logging.debug('钉钉官方限制每个机器人每分钟最多发送20条，当前消息发送频率已达到限制条件，休眠一分钟')
-                time.sleep(60)
-            self.start_time = time.time()
+        now = time.time()
+        
+        # 钉钉自定义机器人安全设置加签时，签名中的时间戳与请求时不能超过一个小时，所以每个1小时需要更新签名
+        if now - self.start_time >= 3600 and self.secret is not None and self.secret.startswith('SEC'):
+            self.start_time = now
+            self.update_webhook()
 
-        post_data = json.dumps(data)
+        # 钉钉自定义机器人现在每分钟最多发送20条消息
+        self.queue.put(now)
+        if self.queue.full():
+            elapse_time = now - self.queue.get()
+            if elapse_time < 60:
+                sleep_time = int(60 - elapse_time) + 1
+                logging.debug('钉钉官方限制机器人每分钟最多发送20条，当前发送频率已达限制条件，休眠 {}s'.format(str(sleep_time)))
+                time.sleep(sleep_time)
+
         try:
+            post_data = json.dumps(data)
             response = requests.post(self.webhook, headers=self.headers, data=post_data)
         except requests.exceptions.HTTPError as exc:
             logging.error("消息发送失败， HTTP error: %d, reason: %s" % (exc.response.status_code, exc.response.reason))
@@ -265,7 +355,7 @@ class ActionCard(object):
         获取ActionCard类型消息数据（字典）
         :return: 返回ActionCard数据
         """
-        if is_not_null_and_blank_str(self.title) and is_not_null_and_blank_str(self.text) and len(self.btns):
+        if all(map(is_not_null_and_blank_str, [self.title, self.text])) and len(self.btns):
             if len(self.btns) == 1:
                 # 整体跳转ActionCard类型
                 data = {
@@ -319,7 +409,7 @@ class FeedLink(object):
         获取FeedLink消息数据（字典）
         :return: 本FeedLink消息的数据
         """
-        if is_not_null_and_blank_str(self.title) and is_not_null_and_blank_str(self.message_url) and is_not_null_and_blank_str(self.pic_url):
+        if all(map(is_not_null_and_blank_str, [self.title, self.message_url, self.pic_url])):
             data = {
                     "title": self.title,
                     "messageURL": self.message_url,
@@ -353,7 +443,7 @@ class CardItem(object):
         获取CardItem子控件数据（字典）
         @return: 子控件的数据
         """
-        if is_not_null_and_blank_str(self.pic_url) and is_not_null_and_blank_str(self.title) and is_not_null_and_blank_str(self.url):
+        if all(map(is_not_null_and_blank_str, [self.title, self.url, self.pic_url])):
             # FeedCard类型
             data = {
                 "title": self.title,
@@ -361,7 +451,7 @@ class CardItem(object):
                 "picURL": self.pic_url
             }
             return data
-        elif is_not_null_and_blank_str(self.title) and is_not_null_and_blank_str(self.url):
+        elif all(map(is_not_null_and_blank_str, [self.title, self.url])):
             # ActionCard类型
             data = {
                 "title": self.title,
